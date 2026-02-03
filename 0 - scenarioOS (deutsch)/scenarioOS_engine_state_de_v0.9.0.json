@@ -1,0 +1,465 @@
+{
+  "meta_notice_top": "WICHTIG: Am Ende dieser Datei befindet sich der Marker [END OF FILE]. Fehlt er, wurde die Datei nicht vollständig geladen.",
+  "module": "scenarioOS",
+  "submodule": "engine",
+  "version": "0.9.3",
+  "part_of": "MetaMemoryWorks",
+  "author": "Johannes Glaser",
+  "schema": "scenarioOS_engine_v1",
+  "meta": {
+    "description": "Vanilla-LLM-Engine-Spezifikation zur Rekonstruktion von Sessions und zur Kompression in portable scenarioOS-State-Dateien. Unterstützt In-Session-Checkpoints, sitzungsübergreifendes Mergen sowie einen Volltext-(txt)-Workflow für Overflow oder forensische Zwecke. Es wird keine externe Toolchain vorausgesetzt – lediglich „Datei hochladen“ und „Datei herunterladen“ in einer typischen Chat-UI.",
+    "design_goal": "Reproduktion des ARBEITSZUSTANDS (Fakten + Entscheidungen + Constraints + Interaktions-/Idiolekt-Konfiguration) statt einer Nacherzählung des gesamten Chats. Bewahre das Wiedereinstiegserlebnis „it feels like we are back“.",
+    "read_only_at_runtime": true,
+    "notes": "Diese Spezifikation nutzt bewusst eine deterministische, schema-first Extraktion. Sie vermeidet Psychologisierung und behandelt Affekt/Stil ausschließlich als Parameter zur Modulation der Ausgabe. | v0.9.1 ergänzt produced_outputs Outcome-Erfassung für State-Artefakte. | v0.9.2 ergänzt produced_outputs capture_mode (selective/exhaustive) mit strikten Exhaustive-Regeln (recall>precision), Status „neutral“ und Domain-Overrides. | v0.9.3 wechselt zu einem verlustaversen, ausführlichen State: recall >> precision, produced outputs niemals verwerfen; Budgets erweitern; Vollständigkeitsmetadaten und 2-Pass-Repair-Routine hinzufügen."
+  },
+  "core_concepts": {
+    "modes": {
+      "regular_in_session": {
+        "alias": "R",
+        "purpose": "Erzeuge einen scenarioOS-Snapshot, solange die relevanten Inhalte noch im Kontextfenster des Modells liegen.",
+        "inputs": [
+          "current_chat_context (wie für das Modell sichtbar)",
+          "optional: in der Session erzeugte Artefaktdateien"
+        ],
+        "outputs": [
+          "scenarioOS_state.json und/oder scenarioOS_lite.json"
+        ]
+      },
+      "extract_from_text_dump": {
+        "alias": "X",
+        "purpose": "Stelle die komplette Historie jenseits des Kontextfensters wieder her, indem ein vom User bereitgestellter vollständiger Chat-Dump als txt/md-Datei verarbeitet wird.",
+        "inputs": [
+          "chat_dump.txt|md (Volltext)",
+          "optional: vorherige scenarioOS_state.json als BASE"
+        ],
+        "outputs": [
+          "scenarioOS_state.json und/oder scenarioOS_lite.json",
+          "optional: merge_report.json"
+        ]
+      },
+      "merge_update": {
+        "alias": "M",
+        "purpose": "Aktualisiere eine einzelne kanonische scenarioOS_state, indem neue Deltas gemergt werden, statt viele separate Dateien zu erzeugen.",
+        "inputs": [
+          "BASE scenarioOS_state.json",
+          "DELTA (entweder Chat-Text im Kontext, oder chat_dump-Datei, oder eine kleine End-of-Session-Delta-Zusammenfassung)"
+        ],
+        "outputs": [
+          "scenarioOS_state.json (aktualisiert)",
+          "merge_report.json"
+        ]
+      }
+    },
+    "artifact_types": {
+      "state": "Komprimierter Long-Context (Fakten + Entscheidungen + Constraints + Glossar + interaction_state + minimale Anker).",
+      "lite": "Priming-Kern auf Prompt-Template-Niveau (keine oder minimale Domain-Fakten; fokussiert auf Working Agreements, Vokabular und interaction_state).",
+      "delta": "Inkrementelles Update-Payload zum Mergen in einen BASE-State."
+    },
+    "time_consistency": {
+      "problem": "Vermeide die Dissonanz eines „Wissensvorsprungs“, bei der ein Snapshot Dinge zu wissen scheint, die erst nach seiner Erstellung passiert sind.",
+      "solution": "Alle Outputs tragen eine „as_of“-Cut-Boundary und dürfen ausschließlich Inhalte bis einschließlich dieser Grenze enthalten."
+    }
+  },
+  "input_contract": {
+    "accepted_inputs": {
+      "chat_dump_file": {
+        "description": "Ein vollständiges Chat-Transkript, aus der UI kopiert (Strg+A → Strg+C) und als .txt oder .md gespeichert. Das ist die autoritative Quelle für Overflow-Recovery.",
+        "requirements": {
+          "encoding": "utf-8",
+          "may_include_ui_noise": true,
+          "may_include_links_labels": true
+        }
+      },
+      "base_state_file": {
+        "description": "Eine bestehende scenarioOS_state.json, die als Merge-Base verwendet wird.",
+        "requirements": {
+          "schema": "scenarioOS_state_v1",
+          "append_only_semantics": true,
+          "has_end_of_file_marker": true
+        }
+      },
+      "cut_boundary_selector": {
+        "description": "Wie „nur bis zu diesem Punkt“ definiert wird. Das kann expliziter Marker-Text, eine ungefähre semantische Beschreibung oder das letzte Export-/Download-Event sein.",
+        "types": [
+          "explicit_marker_text",
+          "semantic_request",
+          "artifact_event_hint"
+        ],
+        "examples": [
+          "Cut beim ersten Auftreten von: 'SCENARIOOS_SNAPSHOT:'",
+          "Cut an der Stelle, an der wir den Ergo-Log-Download erzeugt haben",
+          "Cut bei der letzten Assistant-Nachricht, die den finalen File-Output enthielt"
+        ]
+      }
+    },
+    "assumptions": {
+      "no_external_db": true,
+      "no_hidden_chat_archive_access": true,
+      "vanilla_ui_only": true,
+      "if_text_is_not_provided_engine_cannot_recover_out_of_context_content": true
+    }
+  },
+  "snippet_handling": {
+    "markers": {
+      "top_marker_required_for_full_file": true,
+      "bottom_marker_present_required_for_full_file": true,
+      "behavior": "scenarioOS-State-Dateien gelten NUR dann als vollständig geladen, wenn sowohl der Top-Marker (meta_notice_top) ALS AUCH der dedizierte EOF-Marker-Key sichtbar sind."
+    },
+    "engine_behavior_when_marker_missing": {
+      "description": "Fehlen Marker, behandle die Datei als Snippet und führe keine Merge-Operationen aus, die globalen Kontext voraussetzen.",
+      "steps": [
+        "Wenn die Operation Voll-Datei-Kontext erfordert (Merge/Komprimierung), bitte den User, die vollständige Datei erneut hochzuladen oder den kompletten Inhalt einzufügen.",
+        "Wenn nur ein neuer State aus einem chat_dump erzeugt wird, fahre fort, sofern der chat_dump vollständig ist; andernfalls bitte um den vollständigen Dump."
+      ]
+    }
+  },
+  "compression_pipeline": {
+    "high_level_steps": [
+      "1) Bestimme den Operationsmodus (R/X/M) aus User-Request + verfügbaren Inputs.",
+      "2) Bestimme die Cut-Boundary (as_of), falls angefordert; ansonsten Default = „now“ für das bereitgestellte Input-Material.",
+      "3) Parse den Source-Text in Turns und Segmente (robust gegen UI-Noise).",
+      "4) Extrahiere Decision-Traces und harte Constraints (hohe Gewichtung).",
+      "5) Extrahiere Domain-Fakten und stabile Definitionen (Glossar) mit minimalen Ankern.",
+      "6) Extrahiere Interaktions-/Idiolekt-Konfiguration (Work-Mode + Stil-Modulationsparameter; keine Psychologisierung).",
+      "6b) Capture produced_outputs: konkrete akzeptierte Outputs, nach Zweck gruppiert (z. B. Musik-Empfehlungen, Checklisten, Drafts, Code-Snippets), mit Status active/reserved/deprecated.",
+      "7) Baue scenarioOS-Artefakte (lite/state/delta) innerhalb der Token-Budgets.",
+      "8) (Im Merge-Modus) Merge DELTA in BASE inklusive Konfliktbehandlung.",
+      "9) Gib Dateien zum Download aus."
+    ],
+    "turn_parsing_heuristics": {
+      "goals": [
+        "User- vs. Assistant-Turns trennen",
+        "Prompts erkennen, die den Möglichkeitsraum schließen",
+        "Assistant-Abschlussfragen erkennen",
+        "explizite Negationen/Abbrüche erkennen"
+      ],
+      "signals": {
+        "high_value_user_prompts": [
+          "Negationen: 'nein', 'stopp', 'so nicht', 'das meine ich nicht'",
+          "Constraints: 'nur', 'ohne', 'kein', 'vanilla', 'nicht toolen'",
+          "Mode-Shifts: 'jetzt bauen', 'erst überlegen', 'bevor wir...' "
+        ],
+        "assistant_closure_markers": [
+          "Follow-up-Fragen",
+          "Next-Step-Angebote",
+          "Zusammenfassungen, die Defaults setzen"
+        ]
+      }
+    },
+    "cut_boundary_resolution": {
+      "strategy_order": [
+        "Match auf explicit_marker_text",
+        "artifact_event_hint (z. B. 'download', 'export', 'json', 'file')",
+        "semantic_request mit Kandidatenliste und User-Disambiguierung"
+      ],
+      "candidate_listing": {
+        "behavior": "Wenn der semantische Cut mehrdeutig ist, liste 3–5 Kandidatenstellen (kurze Auszüge) und bitte den User um Auswahl. Wenn der User sich weigert, nimm den neuesten Kandidaten und kennzeichne die Unsicherheit klar."
+      }
+    },
+    "produced_outputs_capture": {
+      "definition": "Konkrete Artefakte, die während des Chats produziert werden und die der User akzeptiert/nutzt (Empfehlungen, Listen, Drafts, Snippets, Routinen).",
+      "high_weight_signals": [
+        "User sagt: 'danke', 'cool', 'passt', 'nehme ich', 'mach ich so', 'done', 'ich starte', 'ich speichere', 'logeintrag?'",
+        "User konserviert: 'das heb ich auf', 'nicht zerhören', 'reserviert für X', 'nur dafür'",
+        "Assistant liefert enumerierte Listen, die später von einer der Parteien referenziert werden"
+      ],
+      "status_rules": {
+        "reserved": "Wenn der User ein Item explizit für einen bestimmten Kontext reserviert (z. B. 'heben wir für capokido auf').",
+        "deprecated": "Wenn der User ein Item oder eine Kategorie ablehnt/ausklammert (z. B. 'andere', 'nicht jamiroquai').",
+        "active": "Default für akzeptierte/genutzte Outputs.",
+        "candidate": "Wenn Akzeptanz mehrdeutig ist; nur aufnehmen, wenn nützlich, und low confidence markieren.",
+        "neutral": "Default im exhaustive mode, wenn weder akzeptiert noch abgelehnt."
+      },
+      "budget": {
+        "default_max_groups": 12,
+        "default_max_items_per_group": 20,
+        "overflow": "Zusätzliche Items nach archive_context.produced_outputs_archive verschieben, mit gleicher Gruppierung."
+      },
+      "capture_mode": {
+        "default": "exhaustive",
+        "how_to_set": [
+          "Wenn der User 'akribisch', 'vollständig', 'alle' verlangt, setze capture_mode='exhaustive'.",
+          "Wenn die Domain 'music recommendations' ist und der User signalisiert, dass alle Items erinnerungswürdig sind, setze capture_mode='exhaustive'.",
+          "Ansonsten selective verwenden."
+        ],
+        "domain_overrides": {
+          "music_recommendations": {
+            "default": "exhaustive",
+            "grouping_examples": [
+              "music.ergo_training",
+              "music.capokido",
+              "music.core_training",
+              "music.general_push"
+            ]
+          },
+          "recommendations_lists": {
+            "default": "exhaustive"
+          },
+          "tooling_options": {
+            "default": "exhaustive"
+          },
+          "checklists_routines": {
+            "default": "exhaustive"
+          },
+          "draft_texts": {
+            "default": "exhaustive"
+          }
+        },
+        "note": "v0.9.3 Default ist exhaustive für scenarioOS_state (loss-averse). selective nur verwenden, wenn der User explizit Kompaktheit verlangt."
+      },
+      "strict_exhaustive_behavior": {
+        "transfer_lists_completely": true,
+        "default_status": "neutral",
+        "maximize_recall": true,
+        "never_drop_outputs": true,
+        "token_budget_handling": "Wenn Outputs das Core-Budget sprengen, Overflow nach archive_context.produced_outputs_archive verschieben; Gruppierung beibehalten; nicht zusammenfassen oder ausdünnen."
+      }
+    },
+    "repair_pass": {
+      "purpose": "Erlaubt dem User, Vollständigkeit schnell zu fixen, ohne TXT-Workflow.",
+      "pass1": "produced_outputs im exhaustive mode generieren + pro Gruppe Counts hinzufügen und needs_user_review=true markieren.",
+      "pass2_trigger_phrases": [
+        "bitte alle",
+        "akribisch",
+        "vollständig",
+        "fehlt",
+        "missing",
+        "add the rest",
+        "include all acts"
+      ],
+      "pass2_behavior": [
+        "Source erneut nach Listen/Empfehlungen scannen und produced_outputs mit strengeren No-Curation-Regeln erneut ausgeben.",
+        "Wenn der User fehlende Items nennt, sie mit Status neutral einfügen, außer der User spezifiziert reserved/deprecated.",
+        "produced_outputs.completeness.verification=user_confirmed setzen, wenn der User bestätigt: 'now complete'."
+      ]
+    }
+  },
+  "output_artifacts": {
+    "scenarioOS_state_v1": {
+      "token_budget_guideline": "Verbose/loss-averse: Bevorzuge 5k–30k Token-Äquivalent für core_context, wenn nötig; Overflow aggressiv nach archive_context verschieben; keine Fakten oder produced outputs verwerfen.",
+      "fields": {
+        "meta": {
+          "schema": "scenarioOS_state_v1",
+          "generated_at": "ISO-8601",
+          "as_of": {
+            "type": "cut_boundary",
+            "value": "string",
+            "source": "explicit|event_hint|semantic",
+            "confidence": "0.0-1.0"
+          },
+          "source_material": {
+            "type": "in_session|chat_dump|mixed",
+            "notes": "string"
+          }
+        },
+        "core_context": {
+          "purpose": "Alles, was für authentischen Wiedereinstieg und korrektes Weiterarbeiten nötig ist.",
+          "components": [
+            "working_agreements",
+            "glossary",
+            "constraints_and_no_gos",
+            "settled_decisions",
+            "interaction_state",
+            "idiolect_profile",
+            "key_metrics_and_numbers (mit Provenienz)",
+            "produced_outputs (akzeptierte Outputs, nach Zweck gruppiert)",
+            "artifact_index (nur Refs)",
+            "open_questions"
+          ]
+        },
+        "archive_context": {
+          "purpose": "Optionale Tiefen-Historie, die in derselben Datei bleibt, aber nicht für jeden Wiedereinstieg nötig ist.",
+          "components": [
+            "decision_history (inkl. ersetzter Einträge)",
+            "timeline_bullets",
+            "additional anchors",
+            "produced_outputs_archive (Overflow-Gruppen/Items)"
+          ]
+        },
+        "merge_history": {
+          "description": "Protokoll der angewendeten Merges und Deltas.",
+          "append_only": true
+        },
+        "produced_outputs": {
+          "purpose": "Speichere konkrete Session-Outputs (Empfehlungen, Listen, generierte Pläne/Snippets), die akzeptiert/genutzt wurden, ohne den Weg nachzuerzählen.",
+          "rules": [
+            "Erfasse Outputs, die explizit akzeptiert, umgesetzt oder später wiederholt referenziert werden. Rohes Brainstorming ignorieren, sofern es nicht später zu accepted output befördert wird.",
+            "Nach funktionalem Zweck/Domain gruppieren (z. B. music.ergo_training, music.capokido, workflows, code_snippets, checklists, draft_texts).",
+            "Jedes Item muss einen Status tragen: active | reserved | deprecated.",
+            "Darstellung listenartig und kompakt halten. Keine langen Erklärungen.",
+            "Bei Mehrdeutigkeit als 'candidate' mit low confidence erfassen ODER User-Disambiguierung anfragen (candidate listing).",
+            "EXHAUSTIVE MODE STRICT: Keine Kuratierung oder Zusammenfassung von Listen. Listen vollständig übertragen.",
+            "EXHAUSTIVE MODE STRICT: Fehlende explizite Akzeptanz bedeutet NICHT Ausschluss; Default-Status ist 'neutral'.",
+            "EXHAUSTIVE MODE STRICT: Keine 'best of'- oder Reduktionslogik; kein evaluativer Kommentar.",
+            "EXHAUSTIVE MODE STRICT: Nur nach funktionalem Zweck gruppieren (domain.purpose)."
+          ],
+          "item_schema": {
+            "status": "enum(active,reserved,neutral,deprecated,candidate)",
+            "items": "array<string>",
+            "anchors": "array<string> (optional short evidence snippets)",
+            "confidence": "0.0-1.0",
+            "capture_mode": "enum(selective,exhaustive)",
+            "notes": "string (optional, max 1 sentence)"
+          },
+          "capture_mode": {
+            "default": "selective",
+            "modes": {
+              "selective": {
+                "goal": "Nur akzeptierte/genutzte Outputs erfassen; precision > recall.",
+                "include": "Explizit akzeptierte/genutzte/referenzierte Outputs.",
+                "exclude": "Rohes Brainstorming, sofern es nicht befördert wird."
+              },
+              "exhaustive": {
+                "goal": "Alle produced outputs erfassen, die als Arbeitsmaterial funktionieren können; recall > precision.",
+                "include": "Alle Listeneinträge, Empfehlungen, Optionen, Varianten, benannte Artefakte, die in-session erzeugt wurden.",
+                "exclude": "Nur triviales Füllmaterial; nicht kuratieren."
+              }
+            }
+          },
+          "completeness": {
+            "intent": "best_effort_exhaustive",
+            "confidence": "0.0-1.0",
+            "verification": "enum(unverified, user_confirmed, source_verified)",
+            "notes": "string (optional, max 1 sentence)"
+          },
+          "group_meta": {
+            "count_items": "integer",
+            "list_complete": "enum(unknown, likely, verified)",
+            "needs_user_review": "boolean",
+            "missing_items_reported_by_user": "array<string> (optional)"
+          }
+        }
+      }
+    },
+    "scenarioOS_lite_v1": {
+      "purpose": "Schnelles Priming ohne Domain-Fakten-Payload; fungiert als Prompt-Template-Ersatz.",
+      "includes": [
+        "working_agreements",
+        "glossary(min)",
+        "interaction_state",
+        "idiolect_profile(min)",
+        "constraints_and_no_gos",
+        "open_questions(min)"
+      ],
+      "excludes": [
+        "vollständige Metrik-Tabellen",
+        "tiefe Artefakt-Zusammenfassungen",
+        "lange Timelines"
+      ]
+    },
+    "scenarioOS_delta_v1": {
+      "purpose": "Inkrementelle Änderungen, die in einen BASE-State gemergt werden.",
+      "includes": [
+        "new or updated decisions",
+        "new constraints",
+        "new glossary items",
+        "interaction_state adjustments",
+        "new metrics",
+        "artifact refs",
+        "open questions updates"
+      ],
+      "must_reference_base_as_of": true
+    }
+  },
+  "interaction_state_and_idiolect": {
+    "principles": {
+      "no_psychologizing": "Keine Aussagen über innere Zustände des Users. Nur beobachtbare sprachliche und interaktive Effekte modellieren.",
+      "non_persistent_affect": "Affektmodulation gilt nur für den aktuellen Rekonstruktions-Output, außer es wird explizit um Persistenz gebeten.",
+      "modulation_not_generation": "Stilparameter modulieren eine bestehende Stimme, statt eine neue Persona zu erzeugen.",
+      "evidence_bound": "Ableiten aus Prompt-Form, Aufgabentyp, Anrede, Markern und Kontext."
+    },
+    "affect_axes_compatibility": {
+      "reference": "writeOS_affect_matrix v0.1.0",
+      "axes": [
+        "arousal(0-1)",
+        "valence(-1..1)",
+        "cognitive_load(0-1)",
+        "social_risk(0-1)",
+        "intentionality(0-1)"
+      ],
+      "note": "Als kompaktes numerisches Profil + Confidence + 1–3 Evidenz-Snippets speichern; lange Analysen vermeiden."
+    },
+    "idiolect_profile_min_fields": [
+      "directness_level",
+      "structure_default (lists vs prose)",
+      "humor_bandwidth",
+      "hedging_tolerance",
+      "repetition_sensitivity",
+      "preferred_depth_default",
+      "meta_allowed",
+      "stop_tokens (user uses hard interrupts, e.g. 'stopp', 'moment')"
+    ],
+    "assistant_style_targets": [
+      "avoid_corporate_smoothing",
+      "be_decisive_when_settled",
+      "ask_disambiguating_questions nur, wenn Ambiguität Handeln blockiert",
+      "Zeilenumbrüche sparsam halten"
+    ]
+  },
+  "merge_protocol": {
+    "base_plus_delta": {
+      "description": "Merge DELTA in BASE und erzeuge eine einzelne aktualisierte scenarioOS_state.json.",
+      "conflict_policy": [
+        "Niemals still überschreiben: frühere Items als superseded markieren und mit dem Ersatz verlinken.",
+        "Wenn zwei Items im Konflikt stehen und keines explizit superseded ist, beide behalten und conflict_note mit Evidenzankern ergänzen.",
+        "Neuere Items nur dann bevorzugen, wenn DELTA explizit eine Korrektur oder einen Ersatz markiert."
+      ],
+      "append_only_semantics": {
+        "decision_ledger": "neue Entscheidung anhängen; alte über Statusfelder superseden",
+        "constraints": "neu anhängen; superseden nur durch explizites Replace",
+        "glossary": "last_seen aktualisieren; neu definieren nur mit explizitem 'redefine'-Flag"
+      }
+    },
+    "merge_report": {
+      "must_include": [
+        "counts_added",
+        "counts_superseded",
+        "conflicts",
+        "as_of_base",
+        "as_of_delta",
+        "generated_at"
+      ]
+    }
+  },
+  "determinism_and_safety": {
+    "invariants": {
+      "no_guessing": "Niemals Fakten oder Metriken erfinden. Unbekannt bleibt unbekannt/null.",
+      "avoid_unwarranted_inference": "Keine User-Traits inferieren; nur beobachtbare Interaktions-/Stilparameter.",
+      "token_budget_awareness": "Kompakte Repräsentation bevorzugen; Tiefe in archive_context verschieben.",
+      "time_consistency": "as_of-Cut-Boundary strikt einhalten.",
+      "vanilla_compatibility": "Alle Operationen müssen in Plain-Chat + Datei-Upload/Download ausdrückbar sein.",
+      "information_loss_averse": "Im verbose state mode: recall vor precision. produced outputs niemals verwerfen; Overflow stattdessen archivieren.",
+      "no_curation_in_exhaustive": "Wenn capture_mode=exhaustive, keine Kuratierung/Reduktion/Zusammenfassung von Listen."
+    },
+    "quality_checks": [
+      "Ist die Datei zeitkonsistent (keine Post-Cut-Items)?",
+      "Sind Fakten/Metriken mit Provenienz oder 'heuristic' gekennzeichnet?",
+      "Sind interaction_state-Parameter evidenzgebunden und nicht-psychologisierend?",
+      "Lässt lite schwere Inhalte wie versprochen weg?",
+      "Wenn state: Enthält produced_outputs akzeptierte konkrete Outputs mit korrekten Status und minimalen Ankern?",
+      "Wenn produced_outputs.capture_mode=exhaustive: Sind alle Listeneinträge übertragen (keine Kuratierung) mit Default-Status neutral, außer reserved/deprecated?",
+      "Verbose mode: Wurden keine produced outputs verworfen (Overflow archiviert statt gepruned)?",
+      "Verbose mode: Sind pro Gruppe Counts vorhanden und needs_user_review gesetzt, wenn verification unverified ist?"
+    ]
+  },
+  "runtime_interface": {
+    "expected_user_commands": [
+      "R: 'Generate scenarioOS_state (as-of now)'",
+      "R: 'Generate scenarioOS_state only up to the point where we exported X'",
+      "X: 'Here is chat_dump.txt — build scenarioOS_state from it'",
+      "M: 'Merge this new dump into my existing scenarioOS_state.json and output a single updated file'",
+      "M+cut: 'Merge only up to boundary Y'"
+    ],
+    "assistant_outputs": [
+      "Download-Links für erzeugte JSON-Dateien bereitstellen.",
+      "Kurz den verwendeten Modus, die as_of-Grenze und eventuelle Mehrdeutigkeiten nennen."
+    ]
+  },
+  "[END OF FILE]": true,
+  "global_preferences": {
+    "loss_averse": true,
+    "verbosity_preference": "high",
+    "principle": "In dieser Version ist Informationsverlust schlimmer als Verbosität. Bevorzuge, mehr zu erfassen und Overflow zu archivieren, statt zu kuratieren."
+  }
+}
+
